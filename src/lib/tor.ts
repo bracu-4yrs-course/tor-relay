@@ -15,20 +15,45 @@
  *   circuit (= a distinct exit IP), so every request leaves from a new IP.
  *   No mock mode, no fallback, no direct routing — every proxied byte
  *   goes through Tor.
+ *
+ * TOR BIN PATH — hardcoded, not env-driven:
+ *   We try a list of known-good install locations in order:
+ *     1. /usr/bin/tor           (apt-get install tor / Dockerfile)
+ *     2. /usr/local/bin/tor    (brew install tor on linux, manual builds)
+ *     3. /home/z/.local/bin/tor (user-mode install on this sandbox)
+ *     4. /home/z/.local/usr/bin/tor  (extracted .deb user-mode)
+ *   If none exists, state -> "binary-missing" and the dashboard surfaces
+ *   a clear error.
  */
 
-import { spawn, ChildProcess, execFile } from "node:child_process";
+import { spawn, ChildProcess } from "node:child_process";
 import { createConnection } from "node:net";
 import { randomUUID } from "node:crypto";
 import { SocksProxyAgent } from "socks-proxy-agent";
-import { promises as fs } from "node:fs";
-import os from "node:os";
+import { promises as fs, existsSync } from "node:fs";
 import path from "node:path";
 
-const TOR_BIN = process.env.TOR_BIN || "tor";
-const TOR_SOCKS = process.env.TOR_SOCKS || "127.0.0.1:9050";
-const TOR_DATA =
-  process.env.TOR_DATA || path.join(os.tmpdir(), "tor-relay-data");
+/** Hardcoded list of tor binary locations to try, in order. */
+const TOR_BIN_CANDIDATES = [
+  "/usr/bin/tor",
+  "/usr/local/bin/tor",
+  "/home/z/.local/bin/tor",
+  "/home/z/.local/usr/bin/tor",
+];
+
+/** Pick the first tor binary that actually exists on disk. */
+function resolveTorBinary(): string {
+  for (const p of TOR_BIN_CANDIDATES) {
+    if (existsSync(p)) return p;
+  }
+  // Fall back to bare "tor" — will rely on PATH lookup. The supervisor
+  // will surface a "binary-missing" state if even that isn't found.
+  return "tor";
+}
+
+const TOR_BIN = resolveTorBinary();
+const TOR_SOCKS = "127.0.0.1:9050";
+const TOR_DATA = "/home/z/tor-data";
 
 const MAX_LOG_LINES = 60;
 
@@ -47,6 +72,7 @@ class TorSupervisor {
   private restartCount = 0;
   private readonly logLines: string[] = [];
   private started = false;
+  private pollerStarted = false;
 
   get state(): TorState {
     return this._state;
@@ -64,7 +90,7 @@ class TorSupervisor {
     return [...this.logLines];
   }
 
-  /** Parse TOR_SOCKS "host:port" → ["host", port]. */
+  /** Parse "host:port" → ["host", port]. */
   private socksHostPort(): [string, number] {
     const [h, p] = TOR_SOCKS.split(":");
     return [h || "127.0.0.1", Number(p || 9050)];
@@ -128,7 +154,8 @@ class TorSupervisor {
           this.log(`tor exited code=${code} signal=${signal} -- restarting in 5s`);
           this._state = "exited";
           this.restartCount++;
-          setTimeout(() => this.start(true), 5000);
+          // schedule restart WITHOUT re-adding the state poller
+          setTimeout(() => this.spawnTorAndAwait(), 5000);
         });
         child.on("error", (err) => {
           this.log(`tor spawn error: ${err.message}`);
@@ -141,9 +168,19 @@ class TorSupervisor {
       });
   }
 
+  /** Spawn tor and wait for SOCKS readiness. Used by both initial start and
+   *  the auto-restart loop (so we don't go through the start() guard). */
+  private spawnTorAndAwait() {
+    if (this._state === "binary-missing") return;
+    this._state = "starting";
+    this.startedAt = Date.now();
+    this.log(`launching tor binary: ${TOR_BIN}`);
+    this.spawnTor();
+    void this.awaitReady();
+  }
+
   private async awaitReady(deadlineSeconds = 180) {
     const deadline = Date.now() + deadlineSeconds * 1000;
-    // Phase 1: wait for SOCKS port to be bound.
     while (Date.now() < deadline) {
       if (this.proc && this.proc.exitCode !== null) {
         // exited; the exit handler will restart
@@ -160,16 +197,30 @@ class TorSupervisor {
     this.log("timeout waiting for tor SOCKS readiness");
   }
 
-  /** Periodic background poll — if tor was "starting" but SOCKS is now
-   *  actually accepting connections, flip to "ready". Also catches the case
-   *  where tor exits and the SOCKS port goes down — flips back to "exited". */
-  private startStatePoller() {
-    setInterval(async () => {
+  /**
+   * Periodic background poll. Created EXACTLY ONCE — the auto-restart loop
+   * calls spawnTorAndAwait(), not start(), so this poller is never
+   * re-instantiated. Without this guarantee we'd stack up multiple
+   * intervals and spam "tor SOCKS is up" every restart cycle.
+   *
+   * The poller's job:
+   *   - if state is "starting" or "exited" and SOCKS port is now open,
+   *     flip to "ready" + log it (catches the case where awaitReady's
+   *     poll loop fired before tor bound the port, or where tor rebound
+   *     after an exit)
+   *   - if state is "ready" but proc has exited, flip to "exited" (so
+   *     the dashboard shows the truth)
+   *   - if state is "binary-missing", do nothing
+   */
+  private startStatePollerOnce() {
+    if (this.pollerStarted) return;
+    this.pollerStarted = true;
+    const h = setInterval(async () => {
       if (this._state === "binary-missing") return;
       if (this._state === "ready") {
-        // Verify still alive
         if (this.proc && this.proc.exitCode !== null) {
           this._state = "exited";
+          this.log("tor process exited unexpectedly (will restart via exit handler)");
         }
         return;
       }
@@ -179,33 +230,27 @@ class TorSupervisor {
           this.log("tor SOCKS is up -- per-request circuits will get fresh exit IPs");
         }
       }
-    }, 5000).unref?.();
+    }, 5000);
+    // Don't keep the event loop alive just for this poller.
+    h.unref?.();
   }
 
-  /** Kick off the supervisor. Idempotent. */
-  start(force = false) {
-    if (this.started && !force) return;
+  /** Kick off the supervisor. Idempotent — calling multiple times is safe. */
+  start() {
+    if (this.started) return;
     this.started = true;
-    this.startStatePoller();
+    this.startStatePollerOnce();
 
-    // Probe whether tor binary is on PATH or at TOR_BIN. If not, surface
-    // a clear error in the dashboard — no silent fallback.
-    execFile("which", [TOR_BIN], (err, stdout) => {
-      const onPath = !err && stdout.trim().length > 0;
-      const absoluteExists = path.isAbsolute(TOR_BIN) && require_fs_exists(TOR_BIN);
-      if (!onPath && !absoluteExists) {
-        this._state = "binary-missing";
-        this.log(
-          `tor binary not found at "${TOR_BIN}". Install tor (apt-get install tor) or set TOR_BIN=/path/to/tor.`,
-        );
-        return;
-      }
-      this._state = "starting";
-      this.startedAt = Date.now();
-      this.log(`launching tor binary: ${TOR_BIN}`);
-      this.spawnTor();
-      void this.awaitReady();
-    });
+    if (!existsSync(TOR_BIN)) {
+      this._state = "binary-missing";
+      this.log(
+        `tor binary not found at any of: ${TOR_BIN_CANDIDATES.join(", ")}. ` +
+          `Install tor (apt-get install tor) and restart the app.`,
+      );
+      return;
+    }
+
+    this.spawnTorAndAwait();
   }
 
   /**
@@ -241,6 +286,7 @@ class TorSupervisor {
     return {
       state: this._state,
       binary: TOR_BIN,
+      binary_candidates: TOR_BIN_CANDIDATES,
       socks: TOR_SOCKS,
       data_dir: TOR_DATA,
       pid: this.proc?.pid ?? null,
@@ -248,18 +294,6 @@ class TorSupervisor {
       restarts: this.restartCount,
       recent_log: this.recentLog(),
     };
-  }
-}
-
-/** Synchronous fs.existsSync shim — kept outside the class so it doesn't
- *  leak into the JSON status output. */
-function require_fs_exists(p: string): boolean {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fsSync = require("node:fs");
-    return fsSync.existsSync(p);
-  } catch {
-    return false;
   }
 }
 
