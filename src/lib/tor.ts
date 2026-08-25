@@ -422,7 +422,7 @@ class TorSupervisor {
     await fs.mkdir(TOR_DATA, { recursive: true });
     const torrc = path.join(TOR_DATA, "torrc");
     const body = [
-      `SocksPort ${host}:${port}`,
+      `SocksPort ${host}:${port} IsolateSOCKSAuth`,
       `DataDirectory ${TOR_DATA}`,
       "Log notice stdout",
       "SafeLogging 1",
@@ -585,7 +585,7 @@ class TorSupervisor {
     const pass = randomUUID().slice(0, 12);
     const [host, port] = this.socksHostPort();
     const proxyUri = `socks5h://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
-    const agent = new SocksProxyAgent(proxyUri);
+    const agent = new SocksProxyAgent(proxyUri, { keepAlive: false });
     return { agent, circuit: user, proxyUri };
   }
 

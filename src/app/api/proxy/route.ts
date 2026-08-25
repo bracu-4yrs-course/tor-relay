@@ -35,7 +35,7 @@ async function probeExitIp(
       // @ts-expect-error node-fetch accepts http.Agent via `agent`
       agent,
       signal,
-      headers: { "user-agent": "tor-relay/probe" },
+      headers: { "user-agent": "tor-relay/probe", connection: "close" },
     });
     const text = await r.text();
     try {
@@ -192,6 +192,7 @@ async function handler(req: NextRequest) {
   req.headers.forEach((v, k) => {
     if (!HOP_HEADERS.has(k.toLowerCase())) upstreamHeaders[k] = v;
   });
+  upstreamHeaders["connection"] = "close";
 
   // -- streaming fetch through the same SOCKS circuit (via node-fetch) --
   let upstream: nodeFetch.Response;
