@@ -1,11 +1,21 @@
 /**
- * Auth helpers shared by protected API routes.
+ * Auth helper for protected routes.
  *
- * The model is intentionally stateless: the client sends the password on
- * every authenticated request via the `x-tor-relay-auth` header (or ?auth=
- * query param). We verify it against the stored hash on each call. This
- * keeps the proxy entirely stateless and avoids cookie / session surface
- * area.
+ * The middleware approach doesn't work because Next.js middleware runs on
+ * the Edge runtime by default, and Prisma needs Node.js. So we do the
+ * auth check inline in each route handler.
+ *
+ * Usage:
+ *   export async function GET(req: NextRequest) {
+ *     const auth = await requireAuthIfLocked(req);
+ *     if (!auth.ok) return auth.response;
+ *     // ... route logic
+ *   }
+ *
+ * When the dashboard is locked AND the caller is unauthenticated, this
+ * returns a 404 (not 401!) so an attacker can't even tell that the
+ * endpoint exists. The only routes that always respond are /, /api/auth,
+ * and /api/settings (which itself returns {needsAuth:true} when locked).
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -15,7 +25,6 @@ export type AuthOutcome =
   | { ok: true; password: string }
   | { ok: false; response: NextResponse };
 
-/** Extract the password candidate from request headers / query. */
 function extractPassword(req: NextRequest): string {
   return (
     req.headers.get("x-tor-relay-auth") ||
@@ -25,12 +34,9 @@ function extractPassword(req: NextRequest): string {
 }
 
 /**
- * Returns the password if the request is authenticated; otherwise a 401
- * response. Use this in endpoints that are gated when the dashboard is
- * locked.
- *
- * If the dashboard is NOT locked, returns { ok: true, password: "" } so
- * the endpoint proceeds normally (no auth required).
+ * Returns the password if the request is authenticated (or if the dashboard
+ * isn't locked). Otherwise returns a 404 response — NOT 401, because we don't
+ * want to confirm the endpoint exists.
  */
 export async function requireAuthIfLocked(
   req: NextRequest,
@@ -46,8 +52,8 @@ export async function requireAuthIfLocked(
     return {
       ok: false,
       response: NextResponse.json(
-        { ok: false, error: "Authentication required.", needsAuth: true },
-        { status: 401 },
+        { error: "Not Found" },
+        { status: 404, headers: { "Cache-Control": "no-store" } },
       ),
     };
   }
@@ -57,8 +63,8 @@ export async function requireAuthIfLocked(
     return {
       ok: false,
       response: NextResponse.json(
-        { ok: false, error: "Incorrect password.", needsAuth: true },
-        { status: 401 },
+        { error: "Not Found" },
+        { status: 404, headers: { "Cache-Control": "no-store" } },
       ),
     };
   }

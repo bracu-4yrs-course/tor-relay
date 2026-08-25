@@ -1,45 +1,57 @@
 import { NextRequest, NextResponse } from "next/server";
-import { publicStatus, verifyPassword } from "@/lib/settings";
+import { publicStatus, verifyPassword, isDashboardLocked, isOpenRelay } from "@/lib/settings";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * GET /api/settings — public status (no secrets).
+ * GET /api/settings — public status.
  *
- * Response:
- *   { hasPassword, dashboardLocked, setupAt, envFallback, isOpenRelay }
+ * When the dashboard is LOCKED and no auth header is provided, returns ONLY:
+ *   { needsAuth: true }
  *
- * If the dashboard is locked, this endpoint still returns public status
- * (it's needed by the login screen). No secrets are ever returned.
+ * No hints about whether a password is set, when it was set, what the relay
+ * mode is, etc. This is intentional — an attacker probing /api/settings
+ * shouldn't learn anything about the deployment.
+ *
+ * When unlocked (or when authenticated), returns the full public status:
+ *   { hasPassword, dashboardLocked, setupAt, envFallback, isOpenRelay,
+ *     authenticated }
  */
 export async function GET(req: NextRequest) {
   const status = await publicStatus();
 
-  // If the dashboard is locked, also verify the caller is authenticated.
-  // The unlock cookie/header is checked here; the login screen uses this
-  // endpoint to know whether to prompt.
+  // Locked?
   if (status.dashboardLocked) {
     const token = req.headers.get("x-tor-relay-auth") || "";
-    if (token) {
-      const ok = await verifyPassword(token);
-      if (!ok) {
-        return NextResponse.json(
-          { ...status, authenticated: false },
-          { status: 401 },
-        );
-      }
+
+    // Open relay — locking has no effect, return full status.
+    if (status.isOpenRelay) {
       return NextResponse.json(
         { ...status, authenticated: true },
         { headers: { "Cache-Control": "no-store" } },
       );
     }
+
+    // Has auth header? Verify it.
+    if (token) {
+      const ok = await verifyPassword(token);
+      if (ok) {
+        return NextResponse.json(
+          { ...status, authenticated: true },
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      }
+    }
+
+    // Not authenticated — return minimal response.
     return NextResponse.json(
-      { ...status, authenticated: false },
-      { status: 200, headers: { "Cache-Control": "no-store" } },
+      { needsAuth: true },
+      { headers: { "Cache-Control": "no-store" } },
     );
   }
 
+  // Not locked — return full status.
   return NextResponse.json(
     { ...status, authenticated: true },
     { headers: { "Cache-Control": "no-store" } },

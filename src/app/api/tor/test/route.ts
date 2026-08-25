@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import nodeFetch from "node-fetch";
 import { ensureTorBooted, supervisor } from "@/lib/tor";
 import { pushLog } from "@/lib/logs";
+import { requireAuthIfLocked } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,8 +14,13 @@ export const dynamic = "force-dynamic";
  *  Uses node-fetch v3 (not native fetch) so the SOCKS `agent` is actually
  *  honored — native fetch silently ignores `agent`, which would make the
  *  probe go direct instead of through Tor.
+ *
+ *  404 when dashboard is locked (no hint).
  */
 export async function POST(req: NextRequest) {
+  const auth = await requireAuthIfLocked(req);
+  if (!auth.ok) return auth.response;
+
   await ensureTorBooted();
   const startedAt = Date.now();
   const ip =

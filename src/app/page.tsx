@@ -84,6 +84,8 @@ type SettingsStatus = {
   envFallback: boolean;
   isOpenRelay: boolean;
   authenticated?: boolean;
+  /** Returned by /api/settings when locked + unauthenticated. */
+  needsAuth?: boolean;
 };
 
 const methodColor: Record<string, string> = {
@@ -398,7 +400,12 @@ export default function Home() {
     });
     if (r.ok) {
       toast.success("All logs cleared");
-      fetchLogs();
+      // BUGFIX: previously, when the user clicked "clear" from the tor
+      // tab, fetchLogs() ran but the user couldn't see the result because
+      // they weren't on the logs view. Now we force-switch to the logs
+      // view so the cleared state is visible.
+      setView("logs");
+      await fetchLogs();
     } else if (r.status === 401) {
       toast.error("Authentication required.");
     } else {
@@ -474,9 +481,73 @@ export default function Home() {
   }, [fetchSettings, fetchLogs]);
 
   // Determine whether to show the login overlay.
+  // Full lock: when locked AND not authenticated, show ONLY the login
+  // screen — no header, no tabs, no hint of what this app is.
+  // Two cases trigger this:
+  //   1. /api/settings returned {needsAuth: true} (locked + unauth)
+  //   2. /api/settings returned dashboardLocked + authenticated: false
   const needsAuth =
-    settingsStatus?.dashboardLocked === true &&
-    settingsStatus?.authenticated === false;
+    settingsStatus?.needsAuth === true ||
+    (settingsStatus?.dashboardLocked === true &&
+      settingsStatus?.authenticated === false);
+
+  // Effect: tag the body so the DevToolsBlocker knows we're on the login
+  // screen and shouldn't blank the page while user types password.
+  useEffect(() => {
+    if (needsAuth) {
+      document.body.classList.add("login-active");
+    } else {
+      document.body.classList.remove("login-active");
+    }
+    return () => document.body.classList.remove("login-active");
+  }, [needsAuth]);
+
+  // ⚠️ FULL LOCK: when locked + unauthenticated, render ONLY the login view.
+  // No header, no nav tabs, no footer, no animated background, no hint of
+  // what this app actually does. The page source / DevTools should reveal
+  // nothing useful.
+  //
+  // Before settingsStatus is loaded, render a blank screen (NOT the
+  // dashboard) so the SSR output doesn't leak the dashboard layout to
+  // anyone who views source.
+  if (needsAuth) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-[#0a0e17] text-slate-100">
+        <LoginView
+          onLogin={async (pwd) => {
+            try {
+              const r = await fetch("/api/auth", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ password: pwd }),
+              });
+              const data = await r.json();
+              if (r.ok && data.authenticated) {
+                setAuth(pwd);
+                await fetchSettings();
+                await fetchLogs();
+                toast.success("Authenticated");
+              } else {
+                toast.error(data.error || "Login failed");
+              }
+            } catch (e) {
+              toast.error(
+                `Login error: ${e instanceof Error ? e.message : String(e)}`,
+              );
+            }
+          }}
+        />
+      </div>
+    );
+  }
+
+  // While we don't know whether auth is required, render a blank dark screen
+  // (NOT the dashboard) so SSR HTML doesn't leak the layout.
+  if (settingsStatus === null) {
+    return (
+      <div className="min-h-screen bg-[#0a0e17]" />
+    );
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-[#0a0e17] text-slate-100">
@@ -665,32 +736,7 @@ export default function Home() {
 
       {/* Main */}
       <main className="relative z-10 mx-auto w-full max-w-[1500px] flex-1 px-4 py-6 sm:px-6 lg:px-8">
-        {needsAuth ? (
-          <LoginView
-            onLogin={async (pwd) => {
-              try {
-                const r = await fetch("/api/auth", {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({ password: pwd }),
-                });
-                const data = await r.json();
-                if (r.ok && data.authenticated) {
-                  setAuth(pwd);
-                  await fetchSettings();
-                  await fetchLogs();
-                  toast.success("Authenticated");
-                } else {
-                  toast.error(data.error || "Login failed");
-                }
-              } catch (e) {
-                toast.error(
-                  `Login error: ${e instanceof Error ? e.message : String(e)}`,
-                );
-              }
-            }}
-          />
-        ) : view === "logs" ? (
+        {view === "logs" ? (
           <LogsView
             loading={loading}
             filtered={filtered}
@@ -714,15 +760,7 @@ export default function Home() {
       <footer className="relative z-10 mt-auto border-t border-slate-800/60 bg-[#0a0e17]/80">
         <div className="mx-auto flex max-w-[1500px] flex-wrap items-center justify-between gap-2 px-4 py-3 text-[11px] text-slate-500 sm:px-6 lg:px-8">
           <span>
-            tor-relay · Next.js 16 · fresh circuit per request ·{" "}
-            <a
-              href="https://github.com/Sexlovr/tor-relay"
-              target="_blank"
-              rel="noreferrer"
-              className="text-slate-400 underline-offset-2 hover:underline"
-            >
-              source
-            </a>
+            dashboard
           </span>
           <span>
             showing {filtered.length} of {logs.length} entries ·{" "}
@@ -1359,10 +1397,9 @@ function LoginView({ onLogin }: { onLogin: (pwd: string) => void | Promise<void>
           <div className="grid h-14 w-14 place-items-center rounded-2xl bg-gradient-to-br from-fuchsia-500/30 to-violet-500/20">
             <Lock className="h-7 w-7 text-fuchsia-300" />
           </div>
-          <h2 className="text-lg font-bold text-slate-100">dashboard locked</h2>
+          <h2 className="text-lg font-bold text-slate-100">locked</h2>
           <p className="text-[12px] text-slate-400">
-            This tor-relay dashboard requires the proxy password. Enter it
-            below to view logs, providers, tor status, and settings.
+            Enter your passphrase to continue.
           </p>
         </div>
         <div className="relative">
@@ -1370,7 +1407,7 @@ function LoginView({ onLogin }: { onLogin: (pwd: string) => void | Promise<void>
             type={show ? "text" : "password"}
             value={pwd}
             onChange={(e) => setPwd(e.target.value)}
-            placeholder="relay password"
+            placeholder="passphrase"
             className="border-slate-700 bg-slate-900/80 pr-9 font-mono"
             onKeyDown={(e) => {
               if (e.key === "Enter" && pwd && !busy) {
