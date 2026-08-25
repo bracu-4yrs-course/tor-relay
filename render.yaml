@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: tor-relay
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PROXY_KEY
+        sync: false
+      - key: ALLOW_HOSTS
+        value: chat.z.ai,api.ipify.org

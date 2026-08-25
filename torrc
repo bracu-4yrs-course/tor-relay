@@ -1,0 +1,6 @@
+# Client-only Tor. Circuit isolation happens at the SOCKS layer: every
+# distinct username:password pair gets its own circuit (app.py sends a
+# random username per request = own circuit = own exit IP).
+SocksPort 127.0.0.1:9050
+DataDirectory /var/lib/tor
+Log notice stdout
