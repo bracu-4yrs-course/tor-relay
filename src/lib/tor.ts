@@ -16,45 +16,241 @@
  *   No mock mode, no fallback, no direct routing — every proxied byte
  *   goes through Tor.
  *
- * TOR BIN PATH — hardcoded, not env-driven:
- *   We try a list of known-good install locations in order:
- *     1. /usr/bin/tor           (apt-get install tor / Dockerfile)
- *     2. /usr/local/bin/tor    (brew install tor on linux, manual builds)
- *     3. /home/z/.local/bin/tor (user-mode install on this sandbox)
- *     4. /home/z/.local/usr/bin/tor  (extracted .deb user-mode)
- *   If none exists, state -> "binary-missing" and the dashboard surfaces
- *   a clear error.
+ * BINARY DISCOVERY:
+ *   1. Check hardcoded candidates (system-installed tor)
+ *   2. If none exists, DOWNLOAD the tor .deb from debian.org and extract
+ *      it into the app's data directory at first boot. This way the app
+ *      is self-bootstrapping — works on fresh sandboxes / Vercel-like
+ *      platforms / Docker images without tor pre-installed.
  */
 
 import { spawn, ChildProcess } from "node:child_process";
 import { createConnection } from "node:net";
 import { randomUUID } from "node:crypto";
 import { SocksProxyAgent } from "socks-proxy-agent";
-import { promises as fs, existsSync } from "node:fs";
+import { promises as fs, existsSync, createWriteStream } from "node:fs";
 import path from "node:path";
+import https from "node:https";
+import { exec as execCb } from "node:child_process";
+import { promisify } from "node:util";
+
+const exec = promisify(execCb);
+
+/** Where the app stores tor's data dir + the downloaded/extracted binary. */
+const TOR_DATA = "/home/z/tor-data";
+/** Where the downloaded .deb is extracted to. */
+const LOCAL_TOR_PREFIX = path.join(TOR_DATA, "extracted");
+/** Where the tor binary lives after extraction. */
+const LOCAL_TOR_BIN = path.join(LOCAL_TOR_PREFIX, "usr", "bin", "tor");
 
 /** Hardcoded list of tor binary locations to try, in order. */
-const TOR_BIN_CANDIDATES = [
-  "/usr/bin/tor",
-  "/usr/local/bin/tor",
-  "/home/z/.local/bin/tor",
-  "/home/z/.local/usr/bin/tor",
-];
-
-/** Pick the first tor binary that actually exists on disk. */
-function resolveTorBinary(): string {
-  for (const p of TOR_BIN_CANDIDATES) {
-    if (existsSync(p)) return p;
-  }
-  // Fall back to bare "tor" — will rely on PATH lookup. The supervisor
-  // will surface a "binary-missing" state if even that isn't found.
-  return "tor";
+function torBinCandidates(): string[] {
+  return [
+    "/usr/bin/tor", // apt-get install tor / Dockerfile
+    "/usr/local/bin/tor", // brew / manual build
+    "/home/z/.local/bin/tor", // user-mode install on dev sandbox
+    "/home/z/.local/usr/bin/tor",
+    LOCAL_TOR_BIN, // downloaded at runtime by ensureTorBinary()
+  ];
 }
 
-const TOR_BIN = resolveTorBinary();
-const TOR_SOCKS = "127.0.0.1:9050";
-const TOR_DATA = "/home/z/tor-data";
+/**
+ * Pick the first tor binary that actually exists on disk.
+ * Returns the absolute path, or null if none exists yet.
+ */
+function findExistingTorBinary(): string | null {
+  for (const p of torBinCandidates()) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
 
+/** Map process.arch to the Debian tor package arch suffix. */
+function debArch(): string {
+  switch (process.arch) {
+    case "x64":
+      return "amd64";
+    case "arm64":
+      return "arm64";
+    case "arm":
+      return "armhf";
+    default:
+      throw new Error(`Unsupported architecture: ${process.arch}`);
+  }
+}
+
+/**
+ * Download a URL to a local file. Returns the local file path.
+ *
+ * Uses node:https directly (not fetch) so it works in plain Node without
+ * depending on undici's quirks. Streams to disk so even big files don't
+ * buffer in memory.
+ */
+function downloadToFile(url: string, dest: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const file = createWriteStream(dest);
+    const get = (u: string, redirectsLeft: number) => {
+      const req = https.get(
+        u,
+        {
+          // Some Debian mirrors want a user-agent
+          headers: { "User-Agent": "tor-relay-installer/1.0" },
+          timeout: 60_000,
+        },
+        (res) => {
+          if (
+            res.statusCode &&
+            res.statusCode >= 300 &&
+            res.statusCode < 400 &&
+            res.headers.location
+          ) {
+            if (redirectsLeft <= 0) {
+              reject(new Error("Too many redirects"));
+              return;
+            }
+            res.destroy();
+            const next = new URL(
+              res.headers.location,
+              u,
+            ).toString();
+            get(next, redirectsLeft - 1);
+            return;
+          }
+          if (!res.statusCode || res.statusCode >= 400) {
+            reject(
+              new Error(
+                `HTTP ${res.statusCode} downloading ${u}`,
+              ),
+            );
+            return;
+          }
+          res.pipe(file);
+          file.on("finish", () => file.close(() => resolve()));
+          file.on("error", (err) => reject(err));
+        },
+      );
+      req.on("error", (err) => reject(err));
+      req.on("timeout", () => {
+        req.destroy(new Error("download timeout"));
+      });
+    };
+    get(url, 5);
+  });
+}
+
+/**
+ * Find the current Debian tor .deb URL by parsing the pool index.
+ *
+ * We can't hardcode the version (it changes). Instead, fetch the directory
+ * listing at https://deb.debian.org/debian/pool/main/t/tor/ and pick the
+ * highest-versioned deb for our arch from the latest stable Debian series
+ * (currently bookworm = deb12, trixie = deb13).
+ */
+async function findLatestTorDebUrl(): Promise<string> {
+  const arch = debArch();
+  const poolUrl = "https://deb.debian.org/debian/pool/main/t/tor/";
+  const listHtml = await new Promise<string>((resolve, reject) => {
+    https.get(
+      poolUrl,
+      { headers: { "User-Agent": "tor-relay-installer/1.0" } },
+      (res) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode} fetching pool index`));
+          return;
+        }
+        let body = "";
+        res.on("data", (c) => (body += c));
+        res.on("end", () => resolve(body));
+      },
+    ).on("error", reject);
+  });
+  // Match all tor_<version>_<arch>.deb filenames
+  const matches = listHtml.match(/tor_[0-9][^"']*?_(?:amd64|arm64|armhf)\.deb/g) || [];
+  if (matches.length === 0) {
+    throw new Error("could not find any tor .deb in pool index");
+  }
+  // Filter for our arch
+  const ours = matches.filter((m) => m.endsWith(`_${arch}.deb`));
+  if (ours.length === 0) {
+    throw new Error(`no tor .deb for arch ${arch}`);
+  }
+  // Prefer the deb13 (trixie) build if available — it's the latest stable
+  // Debian release with tor 0.4.9.x. Otherwise fall back to deb12.
+  const deb13 = ours.filter((m) => m.includes("deb13"));
+  const candidate = (deb13.length > 0 ? deb13 : ours).sort().reverse()[0];
+  return poolUrl + candidate;
+}
+
+/**
+ * Ensure a tor binary is available. If system-installed tor is present,
+ * use it. Otherwise download the Debian .deb and extract it to LOCAL_TOR_PREFIX.
+ *
+ * This is idempotent — once extracted, subsequent boots find LOCAL_TOR_BIN
+ * via the candidate list and skip the download.
+ */
+async function ensureTorBinary(): Promise<string> {
+  // 1. already present?
+  const existing = findExistingTorBinary();
+  if (existing) return existing;
+
+  // 2. need to download + extract
+  console.log("[tor-installer] no tor binary found — downloading...");
+  await fs.mkdir(TOR_DATA, { recursive: true });
+  await fs.mkdir(LOCAL_TOR_PREFIX, { recursive: true });
+
+  const debUrl = await findLatestTorDebUrl();
+  const debFile = path.join(TOR_DATA, "tor.deb");
+  console.log(`[tor-installer] downloading ${debUrl}`);
+  await downloadToFile(debUrl, debFile);
+  console.log(
+    `[tor-installer] downloaded ${(await fs.stat(debFile)).size} bytes`,
+  );
+
+  // Extract using dpkg-deb -x if available, otherwise fall back to ar + tar.
+  // dpkg-deb is more reliable; ar requires manual control.tar extraction.
+  try {
+    await exec(`dpkg-deb -x "${debFile}" "${LOCAL_TOR_PREFIX}"`);
+    console.log(`[tor-installer] extracted via dpkg-deb to ${LOCAL_TOR_PREFIX}`);
+  } catch (err) {
+    // Fallback: use `ar` and `tar` (available on most systems without dpkg-deb)
+    console.log("[tor-installer] dpkg-deb failed, falling back to ar + tar");
+    const tmpAr = path.join(TOR_DATA, "extract-ar");
+    await fs.mkdir(tmpAr, { recursive: true });
+    await exec(`ar x "${debFile}" --output "${tmpAr}"`);
+    // ar produces data.tar.xz (or .gz, or .bz2). Extract it.
+    const dataTar = (await fs.readdir(tmpAr)).find((f) =>
+      f.startsWith("data.tar"),
+    );
+    if (!dataTar) {
+      throw new Error("could not find data.tar in .deb after ar extraction");
+    }
+    const dataTarPath = path.join(tmpAr, dataTar);
+    if (dataTar.endsWith(".xz")) {
+      await exec(`tar -xJf "${dataTarPath}" -C "${LOCAL_TOR_PREFIX}"`);
+    } else if (dataTar.endsWith(".gz")) {
+      await exec(`tar -xzf "${dataTarPath}" -C "${LOCAL_TOR_PREFIX}"`);
+    } else if (dataTar.endsWith(".bz2")) {
+      await exec(`tar -xjf "${dataTarPath}" -C "${LOCAL_TOR_PREFIX}"`);
+    } else if (dataTar.endsWith(".zst")) {
+      await exec(`tar --zstd -xf "${dataTarPath}" -C "${LOCAL_TOR_PREFIX}"`);
+    } else {
+      await exec(`tar -xf "${dataTarPath}" -C "${LOCAL_TOR_PREFIX}"`);
+    }
+    console.log(`[tor-installer] extracted via ar+tar to ${LOCAL_TOR_PREFIX}`);
+  }
+
+  // Verify
+  if (!existsSync(LOCAL_TOR_BIN)) {
+    throw new Error(
+      `tor binary not found at ${LOCAL_TOR_BIN} after extraction`,
+    );
+  }
+  await fs.chmod(LOCAL_TOR_BIN, 0o755);
+  console.log(`[tor-installer] tor binary ready at ${LOCAL_TOR_BIN}`);
+  return LOCAL_TOR_BIN;
+}
+
+const TOR_SOCKS = "127.0.0.1:9050";
 const MAX_LOG_LINES = 60;
 
 type TorState =
@@ -62,6 +258,7 @@ type TorState =
   | "starting"
   | "ready"
   | "binary-missing"
+  | "binary-downloading"
   | "timeout"
   | "exited";
 
@@ -73,6 +270,7 @@ class TorSupervisor {
   private readonly logLines: string[] = [];
   private started = false;
   private pollerStarted = false;
+  private torBin: string | null = null;
 
   get state(): TorState {
     return this._state;
@@ -134,9 +332,14 @@ class TorSupervisor {
   }
 
   private spawnTor() {
+    if (!this.torBin) {
+      this._state = "binary-missing";
+      this.log("cannot spawn tor — no binary resolved");
+      return;
+    }
     void this.writeTorrc()
       .then((torrc) => {
-        const child = spawn(TOR_BIN, ["-f", torrc], {
+        const child = spawn(this.torBin!, ["-f", torrc], {
           stdio: ["ignore", "pipe", "pipe"],
         });
         this.proc = child;
@@ -172,9 +375,14 @@ class TorSupervisor {
    *  the auto-restart loop (so we don't go through the start() guard). */
   private spawnTorAndAwait() {
     if (this._state === "binary-missing") return;
+    if (!this.torBin) {
+      // Should not happen — start() resolves the binary first. But guard.
+      this._state = "binary-missing";
+      return;
+    }
     this._state = "starting";
     this.startedAt = Date.now();
-    this.log(`launching tor binary: ${TOR_BIN}`);
+    this.log(`launching tor binary: ${this.torBin}`);
     this.spawnTor();
     void this.awaitReady();
   }
@@ -202,15 +410,6 @@ class TorSupervisor {
    * calls spawnTorAndAwait(), not start(), so this poller is never
    * re-instantiated. Without this guarantee we'd stack up multiple
    * intervals and spam "tor SOCKS is up" every restart cycle.
-   *
-   * The poller's job:
-   *   - if state is "starting" or "exited" and SOCKS port is now open,
-   *     flip to "ready" + log it (catches the case where awaitReady's
-   *     poll loop fired before tor bound the port, or where tor rebound
-   *     after an exit)
-   *   - if state is "ready" but proc has exited, flip to "exited" (so
-   *     the dashboard shows the truth)
-   *   - if state is "binary-missing", do nothing
    */
   private startStatePollerOnce() {
     if (this.pollerStarted) return;
@@ -231,7 +430,6 @@ class TorSupervisor {
         }
       }
     }, 5000);
-    // Don't keep the event loop alive just for this poller.
     h.unref?.();
   }
 
@@ -241,16 +439,20 @@ class TorSupervisor {
     this.started = true;
     this.startStatePollerOnce();
 
-    if (!existsSync(TOR_BIN)) {
-      this._state = "binary-missing";
-      this.log(
-        `tor binary not found at any of: ${TOR_BIN_CANDIDATES.join(", ")}. ` +
-          `Install tor (apt-get install tor) and restart the app.`,
-      );
-      return;
-    }
-
-    this.spawnTorAndAwait();
+    // Resolve (or download) the tor binary, THEN spawn. Async.
+    void (async () => {
+      try {
+        this._state = "binary-downloading";
+        this.log("ensuring tor binary is available (download if missing)...");
+        this.torBin = await ensureTorBinary();
+        this.log(`tor binary resolved: ${this.torBin}`);
+        this.spawnTorAndAwait();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this._state = "binary-missing";
+        this.log(`failed to obtain tor binary: ${msg}`);
+      }
+    })();
   }
 
   /**
@@ -285,8 +487,9 @@ class TorSupervisor {
   status() {
     return {
       state: this._state,
-      binary: TOR_BIN,
-      binary_candidates: TOR_BIN_CANDIDATES,
+      binary: this.torBin || "(resolving...)",
+      binary_candidates: torBinCandidates(),
+      binary_download_dir: LOCAL_TOR_PREFIX,
       socks: TOR_SOCKS,
       data_dir: TOR_DATA,
       pid: this.proc?.pid ?? null,
