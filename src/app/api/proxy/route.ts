@@ -178,7 +178,8 @@ async function handler(req: NextRequest) {
     });
   }
 
-  // -- allocate a fresh Tor circuit (random SOCKS username = fresh exit IP) --
+  // -- force a NEW circuit via the control port (NEWNYM) + fresh SOCKS agent --
+  await supervisor.sendNewNym();
   const { agent, circuit } = supervisor.newAgent();
   const controller = new AbortController();
   const probeTimeout = setTimeout(() => controller.abort(), 30_000);

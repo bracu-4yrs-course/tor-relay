@@ -26,9 +26,11 @@
  */
 
 import { spawn, ChildProcess } from "node:child_process";
-import { createConnection } from "node:net";
+import { createConnection, Socket } from "node:net";
 import { randomUUID } from "node:crypto";
-import { SocksProxyAgent } from "socks-proxy-agent";
+import { SocksClient } from "socks";
+import { Agent } from "node:http";
+import { connect as tlsConnect } from "node:tls";
 import { promises as fs, existsSync, createWriteStream } from "node:fs";
 import path from "node:path";
 import https from "node:https";
@@ -39,6 +41,75 @@ const exec = promisify(execCb);
 
 /** Where the app stores tor's data dir + the downloaded/extracted binary. */
 const TOR_DATA = "/home/z/tor-data";
+
+/** Custom HTTP agent that creates a SOCKS5 connection through Tor using
+ *  SocksClient DIRECTLY (not via socks-proxy-agent) with explicit userId /
+ *  password. This bypasses any node-fetch / SocksProxyAgent agent-handling
+ *  issues — the SOCKS5 auth handshake is guaranteed to fire because we
+ *  control it at the protocol level. For HTTPS, the raw SOCKS socket is
+ *  wrapped in TLS before being returned. keepAlive is false so every
+ *  request gets a fresh SOCKS handshake = fresh circuit. */
+class TorCircuitAgent extends Agent {
+  private socksHost: string;
+  private socksPort: number;
+  private userId: string;
+  private password: string;
+
+  constructor(opts: {
+    socksHost: string;
+    socksPort: number;
+    userId: string;
+    password: string;
+  }) {
+    super({ keepAlive: false, maxSockets: 1 });
+    this.socksHost = opts.socksHost;
+    this.socksPort = opts.socksPort;
+    this.userId = opts.userId;
+    this.password = opts.password;
+  }
+
+  createConnection(
+    options: Record<string, any>,
+    callback: (err: Error | null, socket?: any) => void,
+  ): void {
+    const host = options.host || options.servername || options.hostname;
+    const port = options.port || 80;
+    const isTLS = !!options.servername || port === 443;
+
+    SocksClient.createConnection({
+      proxy: {
+        host: this.socksHost,
+        port: this.socksPort,
+        type: 5,
+        userId: this.userId,
+        password: this.password,
+      },
+      command: "connect",
+      destination: { host, port },
+      timeout: 30000,
+    })
+      .then(({ socket }: { socket: any }) => {
+        if (isTLS) {
+          const tlsOpts: Record<string, any> = {
+            socket,
+            servername: options.servername || host,
+          };
+          if (options.ALPNProtocols) tlsOpts.ALPNProtocols = options.ALPNProtocols;
+          if (options.ca) tlsOpts.ca = options.ca;
+          if (options.cert) tlsOpts.cert = options.cert;
+          if (options.key) tlsOpts.key = options.key;
+          if (options.rejectUnauthorized !== undefined)
+            tlsOpts.rejectUnauthorized = options.rejectUnauthorized;
+          const tlsSocket = tlsConnect(tlsOpts);
+          tlsSocket.on("secureConnect", () => callback(null, tlsSocket));
+          tlsSocket.on("error", (err: Error) => callback(err));
+        } else {
+          callback(null, socket);
+        }
+      })
+      .catch((err: Error) => callback(err));
+  }
+}
 /** Where the .debs are extracted to. */
 const LOCAL_TOR_PREFIX = path.join(TOR_DATA, "extracted");
 /** Where the tor binary lives after extraction. */
@@ -430,6 +501,9 @@ class TorSupervisor {
       "LearnCircuitBuildTimeout 1",
       "NewCircuitPeriod 10",
       "MaxCircuitDirtiness 10",
+      "ControlPort 127.0.0.1:9051",
+      "CookieAuthentication 1",
+      "CookieAuthFileGroupReadable 1",
       "",
     ].join("\n");
     await fs.writeFile(torrc, body, "utf8");
@@ -577,16 +651,59 @@ class TorSupervisor {
    * Each call uses a fresh random SOCKS username:password.
    */
   newAgent(): {
-    agent: SocksProxyAgent;
+    agent: TorCircuitAgent;
     circuit: string;
     proxyUri: string;
   } {
     const user = "tor-relay-" + randomUUID().slice(0, 8);
     const pass = randomUUID().slice(0, 12);
     const [host, port] = this.socksHostPort();
-    const proxyUri = `socks5h://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
-    const agent = new SocksProxyAgent(proxyUri, { keepAlive: false });
+    const proxyUri = `socks5h://${user}:${pass}@${host}:${port}`;
+    const agent = new TorCircuitAgent({
+      socksHost: host,
+      socksPort: port,
+      userId: user,
+      password: pass,
+    });
     return { agent, circuit: user, proxyUri };
+  }
+
+  /** Send SIGNAL NEWNYM via the control port — forces Tor to discard all
+   *  existing circuits and build fresh ones. The next SOCKS connection gets
+   *  a brand-new circuit with a new exit IP. Rate-limited to 1 per 10s by Tor. */
+  async sendNewNym(): Promise<boolean> {
+    try {
+      const cookiePath = path.join(TOR_DATA, "control_auth_cookie");
+      if (!existsSync(cookiePath)) return false;
+      const cookie = await fs.readFile(cookiePath);
+      const cookieHex = cookie.toString("hex");
+      const sock = new Socket();
+      await new Promise<void>((resolve, reject) => {
+        sock.connect(9051, "127.0.0.1", () => resolve());
+        sock.on("error", reject);
+        sock.setTimeout(5000, () => reject(new Error("control port timeout")));
+      });
+      const sendCmd = (cmd: string) =>
+        new Promise<string>((resolve) => {
+          let buf = "";
+          const handler = (data: Buffer) => {
+            buf += data.toString();
+            if (buf.includes("\r\n")) {
+              sock.removeListener("data", handler);
+              resolve(buf.trim());
+            }
+          };
+          sock.on("data", handler);
+          sock.write(cmd + "\r\n");
+        });
+      const authResp = await sendCmd(`AUTHENTICATE ${cookieHex}`);
+      if (!authResp.startsWith("250")) { sock.destroy(); return false; }
+      const nymResp = await sendCmd("SIGNAL NEWNYM");
+      sock.destroy();
+      return nymResp.startsWith("250");
+    } catch {
+      return false;
+    }
   }
 
   status() {
