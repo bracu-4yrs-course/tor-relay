@@ -422,7 +422,7 @@ class TorSupervisor {
     await fs.mkdir(TOR_DATA, { recursive: true });
     const torrc = path.join(TOR_DATA, "torrc");
     const body = [
-      `SocksPort ${host}:${port} IsolateSOCKSAuth`,
+      `SocksPort ${host}:${port}`,
       `DataDirectory ${TOR_DATA}`,
       "Log notice stdout",
       "SafeLogging 1",
@@ -584,20 +584,8 @@ class TorSupervisor {
     const user = "tor-relay-" + randomUUID().slice(0, 8);
     const pass = randomUUID().slice(0, 12);
     const [host, port] = this.socksHostPort();
-    const proxyUri = `socks5h://${user}:${pass}@${host}:${port}`;
-    // Pass proxy config as an OBJECT with explicit userIdentification —
-    // the string-URI constructor may not reliably send SOCKS5 credentials,
-    // which means Tor wouldn't isolate circuits per username (all requests
-    // share one exit IP). The object form guarantees the auth handshake.
-    const agent = new SocksProxyAgent({
-      proxy: {
-        host,
-        port,
-        type: 5,
-        userIdentification: { username: user, password: pass },
-      },
-      agentOptions: { keepAlive: false },
-    });
+    const proxyUri = `socks5h://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+    const agent = new SocksProxyAgent(proxyUri);
     return { agent, circuit: user, proxyUri };
   }
 
