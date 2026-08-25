@@ -6,12 +6,13 @@ import { pushLog } from "@/lib/logs";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** POST /api/tor/test — spin up a fresh Tor circuit, ask ipify what our
- *  exit IP is, and log the probe so it shows up in the dashboard just like
- *  a real proxied request.
+/** POST /api/tor/test — spin up a fresh Tor circuit (random SOCKS username),
+ *  ask ipify what our exit IP is, and log the probe so it shows up in the
+ *  dashboard just like a real proxied request.
  *
- *  BUG FIX (v2): uses node-fetch (not native fetch) so the SOCKS `agent`
- *  is actually honored.
+ *  Uses node-fetch v3 (not native fetch) so the SOCKS `agent` is actually
+ *  honored — native fetch silently ignores `agent`, which would make the
+ *  probe go direct instead of through Tor.
  */
 export async function POST(req: NextRequest) {
   await ensureTorBooted();
@@ -23,36 +24,8 @@ export async function POST(req: NextRequest) {
   const ua = req.headers.get("user-agent") || "";
   const referer = req.headers.get("referer") || "";
 
-  const { agent, circuit, mock } = supervisor.newAgent();
+  const { agent, circuit } = supervisor.newAgent();
   const target = "https://api.ipify.org?format=json";
-
-  // In mock mode, just pop from the pool — no network call needed.
-  if (mock) {
-    const exitIp = supervisor.popMockExitIp();
-    pushLog({
-      method: "GET",
-      path: "/api/tor/test",
-      target,
-      ip,
-      exitIp,
-      viaTor: false,
-      provider: "ipify",
-      ua,
-      referer,
-      status: 200,
-      durationMs: Date.now() - startedAt,
-      bytes: 0,
-      error: null,
-    });
-    return NextResponse.json({
-      ok: true,
-      exitIp,
-      viaTor: false,
-      circuit,
-      mock: true,
-      ms: Date.now() - startedAt,
-    });
-  }
 
   try {
     const r = await nodeFetch(target, {
@@ -88,7 +61,6 @@ export async function POST(req: NextRequest) {
       exitIp,
       viaTor: true,
       circuit,
-      mock: false,
       ms: Date.now() - startedAt,
     });
   } catch (err) {
@@ -109,7 +81,7 @@ export async function POST(req: NextRequest) {
       error: msg,
     });
     return NextResponse.json(
-      { ok: false, error: msg, exitIp: "unknown", mock: false, circuit },
+      { ok: false, error: msg, exitIp: "unknown", circuit },
       { status: 502 },
     );
   }

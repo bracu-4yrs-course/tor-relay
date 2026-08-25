@@ -20,13 +20,10 @@ function clientIP(req: NextRequest): string {
 /**
  * Probe the exit IP that this SOCKS agent will exit through.
  *
- * Hits api.ipify.org through the SAME circuit so the captured IP is the one
- * that will be used for the real upstream request. In mock / disabled mode,
- * agent is undefined, so this just probes the machine's own public IP.
- *
- * BUG FIX (v2): native Node fetch (undici) silently ignores the `agent`
- * option, so the SOCKS routing was a no-op in v1. We now use node-fetch v3,
- * which honors `agent` and actually routes through SOCKS.
+ * Hits api.ipify.org through the SAME circuit (same random SOCKS username)
+ * so the captured IP is the one that will be used for the real upstream
+ * request. Uses node-fetch v3 — native Node fetch silently ignores the
+ * `agent` option, which would make SOCKS routing a no-op.
  */
 async function probeExitIp(
   agent: unknown,
@@ -54,20 +51,23 @@ async function probeExitIp(
 }
 
 /**
- * tor-relay proxy — streaming, allowlisted, **Tor-routed with fresh exit IP per request**.
+ * tor-relay proxy — streaming, allowlisted, **Tor-routed with a fresh exit IP per request**.
  *
- * Contract (compatible with the original python tor-relay):
+ * Contract (compatible with the original python tor-relay on master):
  *   ANY  /api/proxy?url=<enc>   → relay to (allowlisted) target via Tor
- *   Auth: PROXY_KEY env OR DB-stored password
+ *   Auth: DB-stored password > PROXY_KEY env > open relay
  *         → ?key= or X-Proxy-Key header
  *
- * Bodies stream straight through (no buffering) — SSE-safe.
+ * Every request gets a fresh SOCKS5h agent with a random username:password
+ * — Tor treats a distinct SOCKS user as a distinct circuit, i.e. a distinct
+ * exit IP. No mock mode, no direct routing, no fallback. If tor isn't
+ * ready, the request fails with 502.
  *
  * Dashboard contract:
  *   Every request gets a log entry with `exitIp` = the Tor exit IP that
- *   was used to forward the request. This is what makes tor-relay's
- *   dashboard distinct from vertex-proxy-zai's: the column shows "which
- *   IP the request was routed out through to the URL".
+ *   was used to forward the request. The dashboard's "Exit IP" column
+ *   shows this — i.e. "which IP the request was routed out through to
+ *   the URL".
  */
 async function handler(req: NextRequest) {
   await ensureTorBooted();
@@ -77,9 +77,7 @@ async function handler(req: NextRequest) {
   const ua = req.headers.get("user-agent") || "";
   const referer = req.headers.get("referer") || "";
 
-  // -- proxy auth --
-  // Order of precedence: DB-stored password hash > env var PROXY_KEY.
-  // If neither is set, the relay is "open" (no auth).
+  // -- proxy auth (DB password > env var > open) --
   const open = await isOpenRelay();
   if (!open) {
     const provided =
@@ -180,23 +178,14 @@ async function handler(req: NextRequest) {
     });
   }
 
-  // -- allocate a fresh Tor circuit (fresh exit IP) --
-  const { agent, mock } = supervisor.newAgent();
+  // -- allocate a fresh Tor circuit (random SOCKS username = fresh exit IP) --
+  const { agent, circuit } = supervisor.newAgent();
   const controller = new AbortController();
   const probeTimeout = setTimeout(() => controller.abort(), 30_000);
 
   // -- probe exit IP via the same circuit, before the real request --
-  // BUG FIX (v2): in mock mode, skip the probe and just use the mock pool.
-  // The old code always called probeExitIp, which made a real network
-  // request even in mock mode (wasteful, and could fail in sandboxes
-  // without outbound network).
-  let exitIp = "unknown";
-  if (mock) {
-    exitIp = supervisor.popMockExitIp();
-  } else {
-    const probe = await probeExitIp(agent, controller.signal);
-    exitIp = probe.exitIp;
-  }
+  const probe = await probeExitIp(agent, controller.signal);
+  const exitIp = probe.exitIp;
 
   // -- forward headers (strip hop-by-hop) --
   const upstreamHeaders: Record<string, string> = {};
@@ -207,8 +196,6 @@ async function handler(req: NextRequest) {
   // -- streaming fetch through the same SOCKS circuit (via node-fetch) --
   let upstream: nodeFetch.Response;
   try {
-    // For GET/HEAD there's no request body; for others we stream req.body
-    // through. node-fetch v3 accepts a Node ReadableStream as `body`.
     const fetchOpts: nodeFetch.RequestInit = {
       method: req.method,
       headers: upstreamHeaders,
@@ -219,10 +206,6 @@ async function handler(req: NextRequest) {
       signal: controller.signal,
     };
     if (!["GET", "HEAD"].includes(req.method)) {
-      // node-fetch v3 wants a Node Readable / Buffer. Next's req.body is a
-      // Web ReadableStream — convert via web-stream-to-node or just buffer.
-      // For SSE-safe streaming we'd ideally tee, but most relay use cases
-      // are bounded request bodies (LLM prompts); buffering is fine here.
       fetchOpts.body = Buffer.from(await req.arrayBuffer());
     }
     upstream = await nodeFetch(targetURL.toString(), fetchOpts);
@@ -235,7 +218,7 @@ async function handler(req: NextRequest) {
       target,
       ip,
       exitIp,
-      viaTor: !mock,
+      viaTor: true,
       provider: provider?.id || "—",
       ua,
       referer,
@@ -244,7 +227,10 @@ async function handler(req: NextRequest) {
       bytes: null,
       error: msg,
     });
-    return NextResponse.json({ error: msg }, { status: 502 });
+    return NextResponse.json(
+      { error: msg, circuit, exitIp },
+      { status: 502 },
+    );
   }
 
   // -- stream response back --
@@ -259,8 +245,6 @@ async function handler(req: NextRequest) {
   let bytesReceived = 0;
 
   if (upstream.body) {
-    // node-fetch's body is a Node Readable; wrap as a Web ReadableStream
-    // for NextResponse.
     const nodeReadable = upstream.body;
     const webStream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -276,7 +260,7 @@ async function handler(req: NextRequest) {
             target,
             ip,
             exitIp,
-            viaTor: !mock,
+            viaTor: true,
             provider: provider?.id || "—",
             ua,
             referer,
@@ -296,7 +280,7 @@ async function handler(req: NextRequest) {
             target,
             ip,
             exitIp,
-            viaTor: !mock,
+            viaTor: true,
             provider: provider?.id || "—",
             ua,
             referer,
@@ -316,7 +300,7 @@ async function handler(req: NextRequest) {
           target,
           ip,
           exitIp,
-          viaTor: !mock,
+          viaTor: true,
           provider: provider?.id || "—",
           ua,
           referer,
@@ -339,7 +323,7 @@ async function handler(req: NextRequest) {
     target,
     ip,
     exitIp,
-    viaTor: !mock,
+    viaTor: true,
     provider: provider?.id || "—",
     ua,
     referer,

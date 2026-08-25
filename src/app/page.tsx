@@ -65,7 +65,6 @@ type TorStatus = {
   pid: number | null;
   uptime_s: number | null;
   restarts: number;
-  mock: boolean;
   recent_log: string[];
 };
 
@@ -110,11 +109,7 @@ const torStateStyle: Record<
     border: "border-emerald-500/40",
     bg: "bg-emerald-500/10",
   },
-  mock: {
-    text: "text-amber-300",
-    border: "border-amber-500/40",
-    bg: "bg-amber-500/10",
-  },
+
   starting: {
     text: "text-sky-300",
     border: "border-sky-500/40",
@@ -125,11 +120,7 @@ const torStateStyle: Record<
     border: "border-slate-600",
     bg: "bg-slate-700/20",
   },
-  disabled: {
-    text: "text-slate-400",
-    border: "border-slate-600",
-    bg: "bg-slate-700/20",
-  },
+
   "binary-missing": {
     text: "text-rose-300",
     border: "border-rose-500/40",
@@ -425,7 +416,7 @@ export default function Home() {
       const data = await r.json();
       if (r.ok) {
         toast.success(
-          `Exit IP: ${data.exitIp} · ${data.mock ? "mock" : "via Tor"} · ${data.ms}ms`,
+          `Exit IP: ${data.exitIp} · via Tor · ${data.ms}ms`,
         );
       } else {
         toast.error(`Probe failed: ${data.error || r.status}`);
@@ -645,11 +636,6 @@ export default function Home() {
               <span className={torStateStyle[tor?.state || "stopped"]?.text || "text-slate-400"}>
                 {tor?.state || "loading…"}
               </span>
-              {tor?.mock && (
-                <span className="ml-1 rounded bg-amber-500/15 px-1 text-[9px] text-amber-300">
-                  mock
-                </span>
-              )}
             </span>
             <span className="text-slate-700 hidden sm:inline">|</span>
             <span className="hidden sm:flex items-center gap-1">
@@ -1013,14 +999,6 @@ function TorView({
               >
                 {tor?.state || "loading…"}
               </Badge>
-              {tor?.mock && (
-                <Badge
-                  variant="outline"
-                  className="h-7 border-amber-500/40 bg-amber-500/10 font-mono text-[11px] text-amber-300"
-                >
-                  mock mode
-                </Badge>
-              )}
               <Button
                 size="sm"
                 onClick={onProbe}
