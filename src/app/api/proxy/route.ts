@@ -194,8 +194,21 @@ async function handler(req: NextRequest) {
   );
   const exitIp = probe.exitIp;
 
+  // Upstream lifetime is tied to the CLIENT connection (req.signal): as
+  // long as the caller is still reading, the stream stays open — a long
+  // thinking response can run minutes without a fixed timer killing it.
+  // An idle-deadline (no bytes for 5min) only guards against a hung circuit;
+  // any data resets it.
   const controller = new AbortController();
-  const reqTimeout = setTimeout(() => controller.abort(), 110_000);
+  let idleTimer: ReturnType<typeof setTimeout> | null = setTimeout(
+    () => controller.abort(),
+    300_000,
+  );
+  const bumpIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => controller.abort(), 300_000);
+  };
+  req.signal.addEventListener("abort", () => controller.abort());
 
   // -- forward headers (strip hop-by-hop) --
   const upstreamHeaders: Record<string, string> = {};
@@ -222,7 +235,7 @@ async function handler(req: NextRequest) {
     upstream = await nodeFetch(targetURL.toString(), fetchOpts);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    clearTimeout(reqTimeout);
+    if (idleTimer) clearTimeout(idleTimer);
     pushLog({
       method: req.method,
       path: u.pathname,
@@ -273,11 +286,12 @@ async function handler(req: NextRequest) {
     const webStream = new ReadableStream<Uint8Array>({
       start(controller) {
         nodeReadable.on("data", (chunk: Buffer) => {
+          bumpIdle();
           bytesReceived += chunk.byteLength;
           controller.enqueue(new Uint8Array(chunk));
         });
         nodeReadable.on("end", () => {
-          clearTimeout(reqTimeout);
+          if (idleTimer) clearTimeout(idleTimer);
           pushLog({
             method: req.method,
             path: u.pathname,
@@ -296,7 +310,7 @@ async function handler(req: NextRequest) {
           controller.close();
         });
         nodeReadable.on("error", (e) => {
-          clearTimeout(reqTimeout);
+          if (idleTimer) clearTimeout(idleTimer);
           const msg = e instanceof Error ? e.message : String(e);
           pushLog({
             method: req.method,
@@ -317,7 +331,7 @@ async function handler(req: NextRequest) {
         });
       },
       cancel() {
-        clearTimeout(reqTimeout);
+        if (idleTimer) clearTimeout(idleTimer);
         pushLog({
           method: req.method,
           path: u.pathname,
@@ -340,7 +354,7 @@ async function handler(req: NextRequest) {
   }
 
   // No body — log immediately
-  clearTimeout(reqTimeout);
+  if (idleTimer) clearTimeout(idleTimer);
   pushLog({
     method: req.method,
     path: u.pathname,
