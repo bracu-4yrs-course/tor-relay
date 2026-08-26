@@ -188,8 +188,7 @@ async function handler(req: NextRequest) {
   // -- probe exit IP on a SEPARATE controller so its timeout can never
   //    abort the real request (shared controller = the 'aborted' bug) --
   const probeController = new AbortController();
-  const probeTimeout = setTimeout(() => probeController.abort(), 25_000);
-  clearTimeout(reqTimeout);
+  setTimeout(() => probeController.abort(), 25_000);
   const probe = await probeExitIp(agent, probeController.signal).catch(
     () => ({ exitIp: "unknown", ok: false, error: "probe failed" }),
   );
