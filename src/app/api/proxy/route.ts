@@ -178,15 +178,25 @@ async function handler(req: NextRequest) {
     });
   }
 
-  // -- force a NEW circuit via the control port (NEWNYM) + fresh SOCKS agent --
-  await supervisor.sendNewNym();
+  // -- NEWNYM (fire-and-forget, never blocks the request) + fresh agent --
+  // The random SOCKS credentials alone already force a fresh circuit per
+  // request; NEWNYM is just extra insurance and MUST NOT add latency or
+  // abort the real request. Rate-limited to 1/10s by Tor anyway.
+  void supervisor.sendNewNym().catch(() => {});
   const { agent, circuit } = supervisor.newAgent();
-  const controller = new AbortController();
-  const probeTimeout = setTimeout(() => controller.abort(), 30_000);
 
-  // -- probe exit IP via the same circuit, before the real request --
-  const probe = await probeExitIp(agent, controller.signal);
+  // -- probe exit IP on a SEPARATE controller so its timeout can never
+  //    abort the real request (shared controller = the 'aborted' bug) --
+  const probeController = new AbortController();
+  const probeTimeout = setTimeout(() => probeController.abort(), 25_000);
+  clearTimeout(reqTimeout);
+  const probe = await probeExitIp(agent, probeController.signal).catch(
+    () => ({ exitIp: "unknown", ok: false, error: "probe failed" }),
+  );
   const exitIp = probe.exitIp;
+
+  const controller = new AbortController();
+  const reqTimeout = setTimeout(() => controller.abort(), 110_000);
 
   // -- forward headers (strip hop-by-hop) --
   const upstreamHeaders: Record<string, string> = {};
@@ -213,7 +223,7 @@ async function handler(req: NextRequest) {
     upstream = await nodeFetch(targetURL.toString(), fetchOpts);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    clearTimeout(probeTimeout);
+    clearTimeout(reqTimeout);
     pushLog({
       method: req.method,
       path: u.pathname,
@@ -255,7 +265,7 @@ async function handler(req: NextRequest) {
           controller.enqueue(new Uint8Array(chunk));
         });
         nodeReadable.on("end", () => {
-          clearTimeout(probeTimeout);
+          clearTimeout(reqTimeout);
           pushLog({
             method: req.method,
             path: u.pathname,
@@ -274,7 +284,7 @@ async function handler(req: NextRequest) {
           controller.close();
         });
         nodeReadable.on("error", (e) => {
-          clearTimeout(probeTimeout);
+          clearTimeout(reqTimeout);
           const msg = e instanceof Error ? e.message : String(e);
           pushLog({
             method: req.method,
@@ -295,7 +305,7 @@ async function handler(req: NextRequest) {
         });
       },
       cancel() {
-        clearTimeout(probeTimeout);
+        clearTimeout(reqTimeout);
         pushLog({
           method: req.method,
           path: u.pathname,
@@ -318,7 +328,7 @@ async function handler(req: NextRequest) {
   }
 
   // No body — log immediately
-  clearTimeout(probeTimeout);
+  clearTimeout(reqTimeout);
   pushLog({
     method: req.method,
     path: u.pathname,
