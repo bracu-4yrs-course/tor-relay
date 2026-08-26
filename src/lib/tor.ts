@@ -40,7 +40,7 @@ import { promisify } from "node:util";
 const exec = promisify(execCb);
 
 /** Where the app stores tor's data dir + the downloaded/extracted binary. */
-const TOR_DATA = "/home/z/.local/share/netd";
+const TOR_DATA = process.env.NETD_DATA || path.join(process.env.HOME || "/tmp", ".local", "share", "netd");
 
 /** Custom HTTP agent that creates a SOCKS5 connection through Tor using
  *  SocksClient DIRECTLY (not via socks-proxy-agent) with explicit userId /
