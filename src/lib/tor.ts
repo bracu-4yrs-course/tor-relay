@@ -366,7 +366,10 @@ async function extractDeb(debFile: string, prefix: string): Promise<void> {
 
 /** Sentinel file: written once extraction is complete. We skip the download
  *  if this file exists (so subsequent boots are fast). */
-const EXTRACT_DONE_FILE = path.join(LOCAL_TOR_PREFIX, ".extract-done");
+// Version-stamped: bump the version whenever DEP_PACKAGES changes (e.g.
+// adding libc6) so stale extractions re-download instead of skipping.
+const EXTRACT_VERSION = "v2-libc6";
+const EXTRACT_DONE_FILE = path.join(LOCAL_TOR_PREFIX, `.extract-done-${EXTRACT_VERSION}`);
 
 /**
  * Ensure a tor binary is available. If system-installed tor is present,
@@ -388,6 +391,9 @@ async function ensureTorBinary(): Promise<{ bin: string; libPath: string }> {
   if (existsSync(EXTRACT_DONE_FILE) && existsSync(LOCAL_TOR_BIN)) {
     return { bin: LOCAL_TOR_BIN, libPath: LOCAL_LIB_DIRS.join(":") };
   }
+  // Stale extraction from an older DEP_PACKAGES set — start clean so the
+  // new package list (e.g. libc6 + loader) actually lands on disk.
+  await fs.rm(LOCAL_TOR_PREFIX, { recursive: true, force: true });
 
   // 3. download + extract all packages
   console.log("[netd] init");
