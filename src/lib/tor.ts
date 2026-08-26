@@ -561,8 +561,11 @@ class TorSupervisor {
         const useLoader = multiarchLibDir() === "x86_64-linux-gnu"
           ? loader : armLoader;
         const hasLoader = existsSync(useLoader);
+        this.log(hasLoader
+          ? "loader found — spawning via --library-path (host glibc bypassed)"
+          : "no loader on disk — direct spawn (host glibc used)");
         const child = hasLoader
-          ? spawn(useLoader, [this.torBin!, "-f", confPath], {
+          ? spawn(useLoader, ["--library-path", LOCAL_LIB_DIRS.join(":"), this.torBin!, "-f", confPath], {
               stdio: ["ignore", "pipe", "pipe"],
               env: childEnv,
             })
