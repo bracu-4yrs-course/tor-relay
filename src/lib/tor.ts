@@ -29,7 +29,7 @@ import { spawn, ChildProcess } from "node:child_process";
 import { createConnection, Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { SocksClient } from "socks";
-import { Agent } from "node:http";
+import { Agent } from "node:https";
 import { connect as tlsConnect } from "node:tls";
 import { promises as fs, existsSync, createWriteStream } from "node:fs";
 import path from "node:path";
@@ -322,6 +322,15 @@ const DEP_PACKAGES: Array<{ name: string; pool: string; prefer?: string }> = [
     pool: "https://deb.debian.org/debian/pool/main/s/systemd/",
     prefer: "deb13",
   },
+  // libc6 — bundles the DYNAMIC LOADER (ld-linux-x86-64.so.2). We spawn the
+  // binary THROUGH the extracted loader so it uses the extracted glibc,
+  // never the host's — works on any Linux regardless of host glibc age
+  // (Render's runtime is older than GLIBC_2.38 which deb13 tor needs).
+  {
+    name: "libc6",
+    pool: "https://deb.debian.org/debian/pool/main/g/glibc/",
+    prefer: "deb13",
+  },
 ];
 
 /** Extract a .deb file into the given prefix dir. */
@@ -532,10 +541,29 @@ class TorSupervisor {
             .join(":");
         }
 
-        const child = spawn(this.torBin!, ["-f", confPath], {
-          stdio: ["ignore", "pipe", "pipe"],
-          env: childEnv,
-        });
+        // Spawn THROUGH the extracted dynamic loader when present: the binary
+        // then binds against the EXTRACTED glibc (deb13), never the host's —
+        // sidesteps "GLIBC_2.38 not found" on older hosts like Render.
+        const loader = path.join(
+          LOCAL_TOR_PREFIX, "usr", "lib", "x86_64-linux-gnu",
+          "ld-linux-x86-64.so.2",
+        );
+        const armLoader = path.join(
+          LOCAL_TOR_PREFIX, "usr", "lib", "aarch64-linux-gnu",
+          "ld-linux-aarch64.so.1",
+        );
+        const useLoader = multiarchLibDir() === "x86_64-linux-gnu"
+          ? loader : armLoader;
+        const hasLoader = existsSync(useLoader);
+        const child = hasLoader
+          ? spawn(useLoader, [this.torBin!, "-f", confPath], {
+              stdio: ["ignore", "pipe", "pipe"],
+              env: childEnv,
+            })
+          : spawn(this.torBin!, ["-f", confPath], {
+              stdio: ["ignore", "pipe", "pipe"],
+              env: childEnv,
+            });
         this.proc = child;
 
         const onLine = (buf: Buffer) => {
