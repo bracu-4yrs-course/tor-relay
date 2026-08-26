@@ -266,12 +266,22 @@ function sortByVersionDesc(files: string[]): string[] {
 async function findLatestDeb(
   poolUrl: string,
   preferSubstring?: string,
+  exactName?: string,
 ): Promise<string> {
   const arch = debArch();
   const html = await fetchText(poolUrl);
-  const all = findDebs(html, arch);
+  let all = findDebs(html, arch);
+  if (exactName) {
+    // Pool pages list MULTIPLE packages (glibc pool has libc-bin, libc6,
+    // locales…). The version sort can't tell them apart — pin the exact
+    // package so "libc-bin" never wins over "libc6" (the one carrying
+    // ld-linux and libc.so.6).
+    all = all.filter((f) => f.startsWith(exactName + "_"));
+  }
   if (all.length === 0) {
-    throw new Error(`no .deb files for arch ${arch} at ${poolUrl}`);
+    throw new Error(
+      `no .deb files for arch ${arch} at ${poolUrl}${exactName ? ` matching ${exactName}_` : ""}`,
+    );
   }
   const preferred = preferSubstring
     ? all.filter((f) => f.includes(preferSubstring))
@@ -368,7 +378,7 @@ async function extractDeb(debFile: string, prefix: string): Promise<void> {
  *  if this file exists (so subsequent boots are fast). */
 // Version-stamped: bump the version whenever DEP_PACKAGES changes (e.g.
 // adding libc6) so stale extractions re-download instead of skipping.
-const EXTRACT_VERSION = "v2-libc6";
+const EXTRACT_VERSION = "v3-exact-libc6";
 const EXTRACT_DONE_FILE = path.join(LOCAL_TOR_PREFIX, `.extract-done-${EXTRACT_VERSION}`);
 
 /**
@@ -402,7 +412,7 @@ async function ensureTorBinary(): Promise<{ bin: string; libPath: string }> {
 
   for (const pkg of DEP_PACKAGES) {
     try {
-      const url = await findLatestDeb(pkg.pool, pkg.prefer);
+      const url = await findLatestDeb(pkg.pool, pkg.prefer, pkg.name);
       const filename = path.basename(url);
       const dest = path.join(TOR_DATA, filename);
       if (existsSync(dest)) {
