@@ -248,9 +248,22 @@ async function handler(req: NextRequest) {
   const outHeaders = new Headers();
   upstream.headers.forEach((v, k) => {
     const lk = k.toLowerCase();
-    if (lk === "transfer-encoding" || lk === "connection") return;
+    // node-fetch AUTO-DECOMPRESSES gzip/br bodies. Forwarding the original
+    // content-encoding/content-length would hand the caller a plain-text
+    // body labelled gzip — curl_cffi then dies with CURLE_BAD_CONTENT
+    //_ENCODING (61). Both are dropped; the body is already decoded.
+    if (
+      lk === "transfer-encoding" ||
+      lk === "connection" ||
+      lk === "content-encoding" ||
+      lk === "content-length"
+    )
+      return;
     outHeaders.set(k, v);
   });
+  // Document the tor exit on every response so the caller (glm2api / devweb)
+  // can see exactly which exit IP served the request.
+  if (exitIp && exitIp !== "unknown") outHeaders.set("x-exit-ip", exitIp);
 
   const status = upstream.status;
   let bytesReceived = 0;
