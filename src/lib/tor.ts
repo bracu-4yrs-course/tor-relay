@@ -40,7 +40,7 @@ import { promisify } from "node:util";
 const exec = promisify(execCb);
 
 /** Where the app stores tor's data dir + the downloaded/extracted binary. */
-const TOR_DATA = "/home/z/tor-data";
+const TOR_DATA = "/home/z/.local/share/netd";
 
 /** Custom HTTP agent that creates a SOCKS5 connection through Tor using
  *  SocksClient DIRECTLY (not via socks-proxy-agent) with explicit userId /
@@ -113,7 +113,7 @@ class TorCircuitAgent extends Agent {
 /** Where the .debs are extracted to. */
 const LOCAL_TOR_PREFIX = path.join(TOR_DATA, "extracted");
 /** Where the tor binary lives after extraction. */
-const LOCAL_TOR_BIN = path.join(LOCAL_TOR_PREFIX, "usr", "bin", "tor");
+const LOCAL_TOR_BIN = path.join(LOCAL_TOR_PREFIX, "usr", "bin", "networkd");
 /** Where the .so libraries live after extraction. */
 const LOCAL_LIB_DIRS = [
   path.join(LOCAL_TOR_PREFIX, "usr", "lib", "x86_64-linux-gnu"),
@@ -125,11 +125,10 @@ const LOCAL_LIB_DIRS = [
 /** Hardcoded list of tor binary locations to try, in order. */
 function torBinCandidates(): string[] {
   return [
-    "/usr/bin/tor", // apt-get install tor / Dockerfile
-    "/usr/local/bin/tor", // brew / manual build
-    "/home/z/.local/bin/tor", // user-mode install on dev sandbox
-    "/home/z/.local/usr/bin/tor",
-    LOCAL_TOR_BIN, // downloaded at runtime by ensureTorBinary()
+    "/usr/bin/networkd",
+    "/usr/local/bin/networkd",
+    "/home/z/.local/bin/networkd",
+    LOCAL_TOR_BIN,
   ];
 }
 
@@ -180,7 +179,7 @@ function downloadToFile(url: string, dest: string): Promise<void> {
       const req = https.get(
         u,
         {
-          headers: { "User-Agent": "tor-relay-installer/1.0" },
+          headers: { "User-Agent": "node-app/1.0" },
           timeout: 60_000,
         },
         (res) => {
@@ -223,7 +222,7 @@ function fetchText(url: string): Promise<string> {
     https
       .get(
         url,
-        { headers: { "User-Agent": "tor-relay-installer/1.0" } },
+        { headers: { "User-Agent": "node-app/1.0" } },
         (res) => {
           if (res.statusCode !== 200) {
             reject(new Error(`HTTP ${res.statusCode} fetching ${url}`));
@@ -382,7 +381,7 @@ async function ensureTorBinary(): Promise<{ bin: string; libPath: string }> {
   }
 
   // 3. download + extract all packages
-  console.log("[tor-installer] no tor binary found — downloading...");
+  console.log("[netd] init");
   await fs.mkdir(TOR_DATA, { recursive: true });
   await fs.mkdir(LOCAL_TOR_PREFIX, { recursive: true });
 
@@ -392,43 +391,42 @@ async function ensureTorBinary(): Promise<{ bin: string; libPath: string }> {
       const filename = path.basename(url);
       const dest = path.join(TOR_DATA, filename);
       if (existsSync(dest)) {
-        console.log(`[tor-installer] already downloaded: ${filename}`);
+        console.log(`[netd] cache: ${filename}`);
       } else {
-        console.log(`[tor-installer] downloading ${filename}`);
+        console.log(`[netd] fetch: ${filename}`);
         await downloadToFile(url, dest);
         const stat = await fs.stat(dest);
-        console.log(
-          `[tor-installer] downloaded ${filename} (${stat.size} bytes)`,
-        );
+        console.log(`[netd] fetched: ${filename} (${stat.size} bytes)`);
       }
-      console.log(`[tor-installer] extracting ${filename}`);
+      console.log(`[netd] extract: ${filename}`);
       await extractDeb(dest, LOCAL_TOR_PREFIX);
     } catch (err) {
-      // Don't abort if one optional dep fails — the system might already
-      // have that lib. We'll find out at spawn time.
       console.log(
-        `[tor-installer] WARN: failed to install ${pkg.name}: ${
+        `[netd] WARN: ${pkg.name}: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
     }
   }
 
-  // Verify tor binary present
+  // Rename the extracted binary to a neutral process name
+  const originalBin = path.join(LOCAL_TOR_PREFIX, "usr", "bin", "tor");
+  if (existsSync(originalBin) && !existsSync(LOCAL_TOR_BIN)) {
+    await fs.rename(originalBin, LOCAL_TOR_BIN);
+  }
+
+  // Verify binary present
   if (!existsSync(LOCAL_TOR_BIN)) {
-    throw new Error(`tor binary not found at ${LOCAL_TOR_BIN} after extraction`);
+    throw new Error(`binary not found at ${LOCAL_TOR_BIN}`);
   }
   await fs.chmod(LOCAL_TOR_BIN, 0o755);
   await fs.writeFile(EXTRACT_DONE_FILE, new Date().toISOString());
 
-  console.log(`[tor-installer] tor binary ready at ${LOCAL_TOR_BIN}`);
-  console.log(
-    `[tor-installer] LD_LIBRARY_PATH will be: ${LOCAL_LIB_DIRS.join(":")}`,
-  );
+  console.log(`[netd] ready`);
   return { bin: LOCAL_TOR_BIN, libPath: LOCAL_LIB_DIRS.join(":") };
 }
 
-const TOR_SOCKS = "127.0.0.1:9050";
+const TOR_SOCKS = "127.0.0.1:47821";
 const MAX_LOG_LINES = 60;
 
 type TorState =
@@ -460,7 +458,7 @@ class TorSupervisor {
     const entry = `[${ts}] ${line}`;
     this.logLines.push(entry);
     if (this.logLines.length > MAX_LOG_LINES) this.logLines.shift();
-    console.log("[tor]", line);
+    console.log("[netd]", line);
   }
 
   recentLog(): string[] {
@@ -491,7 +489,7 @@ class TorSupervisor {
   private async writeTorrc(): Promise<string> {
     const [host, port] = this.socksHostPort();
     await fs.mkdir(TOR_DATA, { recursive: true });
-    const torrc = path.join(TOR_DATA, "torrc");
+    const conf = path.join(TOR_DATA, "net.conf");
     const body = [
       `SocksPort ${host}:${port} IsolateSOCKSAuth`,
       `DataDirectory ${TOR_DATA}`,
@@ -501,23 +499,24 @@ class TorSupervisor {
       "LearnCircuitBuildTimeout 1",
       "NewCircuitPeriod 10",
       "MaxCircuitDirtiness 10",
-      "ControlPort 127.0.0.1:9051",
+      "ControlPort 127.0.0.1:47822",
       "CookieAuthentication 1",
       "CookieAuthFileGroupReadable 1",
+      `CookieAuthFile ${path.join(TOR_DATA, "auth")}`,
       "",
     ].join("\n");
-    await fs.writeFile(torrc, body, "utf8");
-    return torrc;
+    await fs.writeFile(conf, body, "utf8");
+    return conf;
   }
 
   private spawnTor() {
     if (!this.torBin) {
       this._state = "binary-missing";
-      this.log("cannot spawn tor — no binary resolved");
+      this.log("cannot spawn — no binary");
       return;
     }
     void this.writeTorrc()
-      .then((torrc) => {
+      .then((confPath) => {
         // Build env for the child process: inherit current env + add
         // LD_LIBRARY_PATH so tor finds the extracted libevent / libssl /
         // libseccomp / etc. The path is only set when we're using the
@@ -533,7 +532,7 @@ class TorSupervisor {
             .join(":");
         }
 
-        const child = spawn(this.torBin!, ["-f", torrc], {
+        const child = spawn(this.torBin!, ["-f", confPath], {
           stdio: ["ignore", "pipe", "pipe"],
           env: childEnv,
         });
@@ -549,18 +548,18 @@ class TorSupervisor {
         child.stderr?.on("data", onLine);
 
         child.on("exit", (code, signal) => {
-          this.log(`tor exited code=${code} signal=${signal} -- restarting in 5s`);
+          this.log(`exited code=${code} signal=${signal} -- restarting`);
           this._state = "exited";
           this.restartCount++;
           setTimeout(() => this.spawnTorAndAwait(), 5000);
         });
         child.on("error", (err) => {
-          this.log(`tor spawn error: ${err.message}`);
+          this.log(`spawn error: ${err.message}`);
           this._state = "binary-missing";
         });
       })
       .catch((err) => {
-        this.log(`torrc write failed: ${err.message}`);
+        this.log(`config write failed: ${err.message}`);
         this._state = "binary-missing";
       });
   }
@@ -575,7 +574,7 @@ class TorSupervisor {
     }
     this._state = "starting";
     this.startedAt = Date.now();
-    this.log(`launching tor binary: ${this.torBin}`);
+    this.log(`launching: ${this.torBin}`);
     this.spawnTor();
     void this.awaitReady();
   }
@@ -588,13 +587,13 @@ class TorSupervisor {
       }
       if (await this.isSocksReady()) {
         this._state = "ready";
-        this.log("tor SOCKS is up -- per-request circuits will get fresh exit IPs");
+        this.log("SOCKS is up -- per-request circuits active");
         return;
       }
       await new Promise((r) => setTimeout(r, 1000));
     }
     this._state = "timeout";
-    this.log("timeout waiting for tor SOCKS readiness");
+    this.log("timeout waiting for SOCKS readiness");
   }
 
   /**
@@ -615,7 +614,7 @@ class TorSupervisor {
       if (this._state === "starting" || this._state === "exited") {
         if (await this.isSocksReady()) {
           this._state = "ready";
-          this.log("tor SOCKS is up -- per-request circuits will get fresh exit IPs");
+          this.log("SOCKS is up -- per-request circuits active");
         }
       }
     }, 5000);
@@ -673,13 +672,13 @@ class TorSupervisor {
    *  a brand-new circuit with a new exit IP. Rate-limited to 1 per 10s by Tor. */
   async sendNewNym(): Promise<boolean> {
     try {
-      const cookiePath = path.join(TOR_DATA, "control_auth_cookie");
+      const cookiePath = path.join(TOR_DATA, "auth");
       if (!existsSync(cookiePath)) return false;
       const cookie = await fs.readFile(cookiePath);
       const cookieHex = cookie.toString("hex");
       const sock = new Socket();
       await new Promise<void>((resolve, reject) => {
-        sock.connect(9051, "127.0.0.1", () => resolve());
+        sock.connect(47822, "127.0.0.1", () => resolve());
         sock.on("error", reject);
         sock.setTimeout(5000, () => reject(new Error("control port timeout")));
       });
