@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000 2>&1 | tee dev.log",
-    "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
+    "build": "prisma generate && next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
     "start": "sh -c 'DATABASE_URL=${DATABASE_URL:-file:/tmp/netd.db}; export DATABASE_URL; npx prisma db push --accept-data-loss --skip-generate || true; HOSTNAME=0.0.0.0 exec node .next/standalone/server.js'",
     "lint": "eslint .",
     "db:push": "prisma db push --accept-data-loss",
@@ -96,5 +96,9 @@
     "tailwindcss": "^4",
     "tw-animate-css": "^1.3.5",
     "typescript": "^5"
-  }
+  },
+  "trustedDependencies": [
+    "prisma",
+    "@prisma/client"
+  ]
 }
