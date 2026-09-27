@@ -46,7 +46,15 @@ const nextConfig: NextConfig = {
   // Strip even more headers from responses. Next doesn't normally let you
   // remove Server, but we can at least not add anything identifying.
   async rewrites() {
-    return [];
+    return [
+      {
+        // Legacy contract from the python tor-relay (master) — glm2api's
+        // egress pool builds {base}/proxy?url=<enc>. Rewrite it onto the
+        // Next.js route so either path works; the query string rides along.
+        source: "/proxy",
+        destination: "/api/proxy",
+      },
+    ];
   },
 };
 

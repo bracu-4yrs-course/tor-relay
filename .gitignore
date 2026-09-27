@@ -51,4 +51,6 @@ prompt
 
 server.log
 # Skills directory
-/skills/
+/skills/ECHO is on.
+"# local runtime sqlite (prisma db push)"  
+"prisma/db/"  

@@ -65,6 +65,15 @@ export const PROVIDERS: Provider[] = [
     hosts: ["chat.z.ai"],
   },
   {
+    id: "chatglm",
+    name: "ChatGLM",
+    color:
+      "bg-sky-500/15 text-sky-300 border-sky-500/30",
+    description:
+      "Zhipu ChatGLM web-chat surface (chatglm.cn) — the glm2api native upstream. Rides the same fresh-exit-per-request Tor path as every other provider.",
+    hosts: ["chatglm.cn"],
+  },
+  {
     id: "ipify",
     name: "ipify (probe)",
     color:
