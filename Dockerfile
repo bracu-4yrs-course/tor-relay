@@ -28,13 +28,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tor ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# HF Spaces runs containers as UID 1000 — create the user up front.
-RUN useradd -m -u 1000 -s /bin/bash user \
-    && mkdir -p /app \
-    && chown -R 1000:1000 /app
+# node:22-slim already ships a "node" user with UID 1000 — reuse it.
+# (A "useradd -u 1000" here fails on this base image: "UID 1000 is not unique",
+# which is what broke the Railway build.)
+RUN mkdir -p /app /home/node/.local/share \
+    && chown -R node:node /app /home/node
 
 WORKDIR /app
-ENV HOME=/home/user \
+ENV HOME=/home/node \
     NEXT_TELEMETRY_DISABLED=1
 
 # Dependencies first (layer stays cached while only app code changes).
@@ -48,14 +49,14 @@ RUN npm ci --no-audit --no-fund
 # (see the "build" script in package.json).
 COPY . .
 RUN npm run build \
-    && chown -R 1000:1000 /app
+    && chown -R node:node /app
 
 # --- runtime ----------------------------------------------------------------
 ENV PORT=7860 \
     HOSTNAME=0.0.0.0 \
     DATABASE_URL=file:/tmp/netd.db
 
-USER 1000
+USER node
 EXPOSE 7860
 
 # npm start = npx prisma db push (create SQLite schema) + exec the standalone
