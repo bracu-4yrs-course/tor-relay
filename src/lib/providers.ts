@@ -6,6 +6,10 @@
  * allowlist to cover the major AI provider endpoints, plus a few test
  * hosts. Each host is bucketed into a "provider" so the dashboard can
  * group / filter / count by provider.
+ *
+ * Volcengine Ark / BytePlus ModelArk was added on request ("modelark") so
+ * ModelArk API traffic can ride the relay — e.g. from NovaGate deployed on
+ * Cloudflare Workers via its relay egress lane.
  */
 
 export type Provider = {
@@ -72,6 +76,18 @@ export const PROVIDERS: Provider[] = [
     description:
       "Zhipu ChatGLM web-chat surface (chatglm.cn) — the glm2api native upstream. Rides the same fresh-exit-per-request Tor path as every other provider.",
     hosts: ["chatglm.cn"],
+  },
+  {
+    id: "modelark",
+    name: "ModelArk",
+    color:
+      "bg-rose-500/15 text-rose-300 border-rose-500/30",
+    description:
+      "Volcengine Ark / BytePlus ModelArk — OpenAI-compatible model endpoints (doubao + friends). China: ark.cn-beijing.volces.com, international: ark.ap-southeast.bytepluses.com. Riding the relay gives these API calls a fresh Tor exit per request.",
+    hosts: [
+      "ark.cn-beijing.volces.com",
+      "ark.ap-southeast.bytepluses.com",
+    ],
   },
   {
     id: "ipify",
