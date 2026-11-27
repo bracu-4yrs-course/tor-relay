@@ -134,4 +134,19 @@ The original python FastAPI app is preserved in [`legacy/`](./legacy) for refere
 
 ## Deploy
 
-This Next.js app deploys like any other Next.js 16 app (Vercel / Render / self-hosted). The original deploy notes about Render apply (it allows tor daemons; Railway does not). The `legacy/Dockerfile` shows the tor + python pattern — for the Next.js version you'd want a Dockerfile that installs both tor and Node.
+The repo ships a root `Dockerfile` (Next.js standalone + apt-installed tor, spawned and supervised by the app itself) — deploy it on any Docker host that lets a container run a tor daemon (HuggingFace Spaces Docker SDK, Fly.io, Northflank, a VPS… Vercel/Railway native builders don't fit that bill).
+
+### Docker (single container, tor inside)
+
+```bash
+docker build -t tor-relay .
+docker run -p 7860:7860 -e PROXY_KEY=your-secret tor-relay
+# relay: http://127.0.0.1:7860/api/proxy?url=<enc>&key=your-secret
+```
+
+- **HuggingFace Spaces** — create a Space with SDK = Docker, point it at this repo (or copy the Dockerfile + repo into the Space); port 7860 is already baked in (`ENV PORT=7860`). Set `PROXY_KEY` as a Space secret.
+- **Generic PaaS** — bind `0.0.0.0:$PORT` (already handled by the `start` script); persist nothing — SQLite defaults to `/tmp`, and the dashboard password/hash lives in it (set the password again after a redeploy, or keep using `PROXY_KEY`).
+
+Healthcheck: `GET /api/health` (tor state included). Lock the relay with `PROXY_KEY` (env) or the dashboard Settings password (stored in SQLite, takes precedence).
+
+Point an OpenAI-compatible consumer at it through the relay lane: any client that can reach the relay URL can now route provider-allowlisted requests with a **fresh Tor exit IP per request** — e.g. NovaGate on Cloudflare Workers with `EGRESS=relay`, `RELAY_BASE=https://<this-deployment>`, `RELAY_KEY=<proxy key>`.

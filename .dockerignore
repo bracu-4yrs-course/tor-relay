@@ -1,0 +1,14 @@
+# Never COPY into the image:
+node_modules
+.next
+.git
+.gitignore
+*.log
+npm-debug.log*
+.env
+.env.*
+!.env.example
+Dockerfile*
+README_RAILWAY.md
+legacy
+Caddyfile
