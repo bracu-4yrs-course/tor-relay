@@ -90,6 +90,15 @@ export const PROVIDERS: Provider[] = [
     ],
   },
   {
+    id: "baidu",
+    name: "Baidu Qianfan",
+    color:
+      "bg-red-500/15 text-red-300 border-red-500/30",
+    description:
+      "Baidu AI Cloud experience / Qianfan guest lane (cloud.baidu.com/api/qianfan/completions) — the reversed free-tier wire NovaGate rides as its baidu/* provider. Fresh Tor exit per request.",
+    hosts: ["cloud.baidu.com"],
+  },
+  {
     id: "ipify",
     name: "ipify (probe)",
     color:

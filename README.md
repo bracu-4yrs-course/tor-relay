@@ -7,7 +7,7 @@ This branch (`nextjs-dashboard`) is the Next.js 16 + Tailwind 4 + shadcn/ui rewr
 - **Exit IP column** — every log entry shows the Tor exit IP that the request was routed out through to the target URL (the user-requested feature).
 - **In-app password management** — set / change / clear the proxy password from the dashboard's Settings tab. Stored as a bcrypt hash in SQLite (no env var editing required).
 - **Dashboard lock** — optionally require the password to view logs / settings / tor.
-- **Expanded provider allowlist** — Vertex AI, Gemini API, OpenAI, Anthropic, Z.ai, ChatGLM, ModelArk (Volcengine Ark / BytePlus), ipify, plus test hosts (original python relay only allowed `chat.z.ai` + `api.ipify.org`).
+- **Expanded provider allowlist** — Vertex AI, Gemini API, OpenAI, Anthropic, Z.ai, ChatGLM, ModelArk (Volcengine Ark / BytePlus), Baidu Qianfan (cloud.baidu.com), ipify, plus test hosts (original python relay only allowed `chat.z.ai` + `api.ipify.org`).
 - **Tor supervisor in Node** — spawns tor, waits for SOCKS readiness, auto-restarts on death, exposes state via `/api/tor`. Falls back to mock mode when the tor binary isn't installed (so the dashboard is still demonstrable in sandboxes).
 
 ## Architecture
@@ -37,7 +37,7 @@ src/
     ├── auth.ts                          # requireAuthIfLocked helper
     ├── db.ts                            # Prisma client
     ├── logs.ts                          # in-memory log store (exitIp, viaTor, provider, bytes)
-    ├── providers.ts                     # Vertex/Gemini/OpenAI/Anthropic/Z.ai/ChatGLM/ModelArk allowlist
+    ├── providers.ts                     # Vertex/Gemini/OpenAI/Anthropic/Z.ai/ChatGLM/ModelArk/Baidu allowlist
     ├── settings.ts                      # bcrypt password storage + lock state
     ├── tor.ts                           # TorSupervisor + per-request SOCKS agent factory
     └── utils.ts                         # cn helper
